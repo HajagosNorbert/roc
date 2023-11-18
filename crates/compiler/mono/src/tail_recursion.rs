@@ -55,8 +55,6 @@ pub fn apply_trmc<'a, 'i>(
             let trmc_candidate_symbols = trmc_candidates(env.interner, env.arena, proc);
 
             if !trmc_candidate_symbols.is_empty() {
-                println!("{:#?}", trmc_candidate_symbols);
-                println!("{:?}", trmc_candidate_symbols);
                 let new_proc =
                     crate::tail_recursion::TrmcEnv::init(env, proc, trmc_candidate_symbols);
                 *proc = new_proc;
@@ -409,34 +407,26 @@ fn insert_jumps<'a>(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+enum RecCallLocation<'a> {
+    DirectlyInTag,
+    MemberOfStruct(Symbol, &'a [u64]),
+}
+
+#[derive(Debug, Default)]
 struct TrmcCandidateSet<'a> {
     interner: arrayvec::ArrayVec<Symbol, 64>,
-    indices: [Option<&'a [u64]>; 64],
-    // indices: arrayvec::ArrayVec<&'a [u64], 64>,
+    call_localtions: arrayvec::ArrayVec<RecCallLocation<'a>, 64>,
     confirmed: u64,
     active: u64,
     invalid: u64,
 }
 
-impl<'a> Default for TrmcCandidateSet<'a> {
-    fn default() -> Self {
-        Self {
-            interner: Default::default(),
-            indices: [None; 64],
-            confirmed: Default::default(),
-            active: Default::default(),
-            invalid: Default::default(),
-        }
-    }
-}
-
 impl<'a> TrmcCandidateSet<'a> {
-    fn confirmed(&self) -> impl Iterator<Item = Symbol> + '_ {
-        self.interner
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| (self.confirmed & (1 << i) != 0).then_some(*s))
+    fn confirmed(&self) -> impl Iterator<Item = (Symbol, RecCallLocation)> + '_ {
+        self.interner.iter().enumerate().filter_map(|(i, s)| {
+            (self.confirmed & (1 << i) != 0).then_some((*s, self.call_localtions[i].clone()))
+        })
     }
 
     fn active(&self) -> impl Iterator<Item = Symbol> + '_ {
@@ -456,6 +446,7 @@ impl<'a> TrmcCandidateSet<'a> {
 
         let index = self.interner.len();
         self.interner.push(symbol);
+        self.call_localtions.push(RecCallLocation::DirectlyInTag);
 
         self.active |= 1 << index;
     }
@@ -476,7 +467,7 @@ impl<'a> TrmcCandidateSet<'a> {
         }
     }
 
-    fn confirm_with_struct_index(&mut self, symbol: Symbol, indices: &'a [u64]) {
+    fn confirm(&mut self, symbol: Symbol, loc: RecCallLocation<'a>) {
         match self.position(symbol) {
             None => debug_assert_eq!(0, 1, "confirm of invalid symbol"),
             Some(index) => {
@@ -486,23 +477,7 @@ impl<'a> TrmcCandidateSet<'a> {
 
                 self.active &= !mask;
                 self.confirmed |= mask;
-
-                self.indices[index] = Some(indices)
-            }
-        }
-    }
-
-    fn confirm(&mut self, symbol: Symbol) {
-        match self.position(symbol) {
-            None => debug_assert_eq!(0, 1, "confirm of invalid symbol"),
-            Some(index) => {
-                let mask = 1 << index;
-
-                debug_assert_eq!(self.invalid & mask, 0);
-                debug_assert_ne!(self.active & mask, 0);
-
-                self.active &= !mask;
-                self.confirmed |= mask;
+                self.call_localtions[index] = loc;
             }
         }
     }
@@ -556,7 +531,7 @@ fn trmc_candidates_help<'a>(
                     .active()
                     .find(|call| cons_info.arguments.contains(call))
             })
-            .map(|call| (call, None)),
+            .map(|call| (call, RecCallLocation::DirectlyInTag)),
         Some(StructWithRecCall {
             struct_symbol,
             next,
@@ -570,21 +545,22 @@ fn trmc_candidates_help<'a>(
                     .contains(struct_symbol)
                     .then_some(rec_call_value)
             })
-            .map(|call| (*call, Some(index_of_rec_call_value))),
+            .map(|call| {
+                (
+                    *call,
+                    RecCallLocation::MemberOfStruct(
+                        *struct_symbol,
+                        // seems unnecessary, but will need it when we'll be able to detect usage of
+                        // recursive call return values in nested records
+                        vec![in arena; index_of_rec_call_value].into_bump_slice(),
+                    ),
+                )
+            }),
     };
 
     // if we find a usage, this is a confirmed TRMC call
-    if let Some((recursive_call, index_opt)) = recursive_call {
-        match index_opt {
-            Some(index) => {
-                // seems unnecessary, but will need it when we'll be able to detect usage of
-                // recursive call return values in nested records
-                let indices = vec![in arena; index].into_bump_slice();
-                candidates.confirm_with_struct_index(recursive_call, indices)
-            }
-            None => candidates.confirm(recursive_call),
-        }
-
+    if let Some((recursive_call, loc_of_rec_call)) = recursive_call {
+        candidates.confirm(recursive_call, loc_of_rec_call);
         return;
     }
 
@@ -596,7 +572,7 @@ fn trmc_candidates_help<'a>(
     });
     let dbg_changed_after = candidates.active().count();
     if dbg_changed != dbg_changed_after {
-        println!("{:#?}", stmt)
+        // println!("{:#?}", stmt)
     }
 
     match stmt {
@@ -865,7 +841,13 @@ impl<'a> TrmcEnv<'a> {
 
         let jump_stmt = Stmt::Jump(joinpoint_id, jump_arguments.into_bump_slice());
 
-        let trmc_calls = trmc_calls.confirmed().map(|s| (s, None)).collect();
+        let (trmc_calls, trmc_call_locations): (
+            VecMap<Symbol, Option<Call>>,
+            std::vec::Vec<RecCallLocation>,
+        ) = trmc_calls
+            .confirmed()
+            .map(|(s, loc)| ((s, None), loc))
+            .unzip();
 
         let mut this = Self {
             lambda_name: proc.name,
@@ -892,7 +874,7 @@ impl<'a> TrmcEnv<'a> {
         let joinpoint = Stmt::Join {
             id: joinpoint_id,
             parameters: joinpoint_parameters.into_bump_slice(),
-            body: arena.alloc(this.walk_stmt(env, &proc.body)),
+            body: arena.alloc(this.walk_stmt(env, &proc.body, &trmc_call_locations)),
             remainder: arena.alloc(jump_stmt),
         };
 
@@ -918,7 +900,12 @@ impl<'a> TrmcEnv<'a> {
         }
     }
 
-    fn walk_stmt(&mut self, env: &mut Env<'a, '_>, stmt: &Stmt<'a>) -> Stmt<'a> {
+    fn walk_stmt<'b>(
+        &mut self,
+        env: &mut Env<'a, '_>,
+        stmt: &Stmt<'a>,
+        locations: &'b [RecCallLocation],
+    ) -> Stmt<'a> {
         let arena = env.arena;
 
         match stmt {
@@ -938,7 +925,7 @@ impl<'a> TrmcEnv<'a> {
 
                     *opt_call = Some(call.clone());
 
-                    return self.walk_stmt(env, next);
+                    return self.walk_stmt(env, next, locations);
                 }
 
                 if let Some(call) =
@@ -960,11 +947,27 @@ impl<'a> TrmcEnv<'a> {
                     // TODO: allow structs here
                     let opt_recursive_call = cons_info.arguments.iter().find_map(|arg| {
                         self.trmc_calls
-                            .get(arg)
-                            .and_then(|x| x.as_ref())
-                            .map(|x| (arg, x))
+                            // .get(arg)
+                            // .and_then(|x| x.as_ref())
+                            // .map(|x| (arg, x))
+                            .keys()
+                            .enumerate()
+                            .position(|(i, call)| {
+                                *call == *arg
+                                    || matches!(
+                                        locations[i],
+                                        RecCallLocation::MemberOfStruct(struct_symbol, _) if struct_symbol == *arg
+                                    )
+                            })
+                            .and_then(|idx| {
+                                self.trmc_calls
+                                    .values()
+                                    .nth(idx)
+                                    .unwrap()
+                                    .as_ref()
+                                    .map(|call| (arg, call, &locations[idx]))
+                            })
                     });
-
                     match opt_recursive_call {
                         None => {
                             // this control flow path did not encounter a recursive call. Just
@@ -979,7 +982,7 @@ impl<'a> TrmcEnv<'a> {
 
                             return output;
                         }
-                        Some((call_symbol, call)) => {
+                        Some((call_symbol, call, location)) => {
                             // we did encounter a recursive call, and can perform TRMC in this
                             // branch.
 
@@ -988,7 +991,7 @@ impl<'a> TrmcEnv<'a> {
 
                             let recursive_field_index = match opt_recursive_field_index {
                                 None => {
-                                    let next = self.walk_stmt(env, next);
+                                    let next = self.walk_stmt(env, next, locations);
                                     return Stmt::Let(
                                         *symbol,
                                         expr.clone(),
@@ -1019,10 +1022,11 @@ impl<'a> TrmcEnv<'a> {
                                 arguments: arguments.into_bump_slice(),
                                 reuse: None,
                             };
-
-                            let indices = arena
-                                .alloc([cons_info.tag_id as u64, recursive_field_index as u64]);
-
+                            let mut indices = vec![in env.arena; cons_info.tag_id as u64, recursive_field_index as u64, ];
+                            if let RecCallLocation::MemberOfStruct(_, struct_indices) = location {
+                                indices.extend_from_slice(struct_indices);
+                            }
+                            let indices = indices.into_bump_slice();
                             let let_tag = |next| Stmt::Let(*symbol, tag_expr, *layout, next);
                             let get_reference_expr = Expr::GetElementPointer {
                                 structure: *symbol,
@@ -1069,7 +1073,7 @@ impl<'a> TrmcEnv<'a> {
                     }
                 }
 
-                let next = self.walk_stmt(env, next);
+                let next = self.walk_stmt(env, next, locations);
                 Stmt::Let(*symbol, expr.clone(), *layout, arena.alloc(next))
             }
             Stmt::Switch {
@@ -1082,12 +1086,13 @@ impl<'a> TrmcEnv<'a> {
                 let mut new_branches = Vec::with_capacity_in(branches.len(), arena);
 
                 for (id, info, stmt) in branches.iter() {
-                    let new_stmt = self.walk_stmt(env, stmt);
+                    let new_stmt = self.walk_stmt(env, stmt, locations);
 
                     new_branches.push((*id, info.clone(), new_stmt));
                 }
 
-                let new_default_branch = &*arena.alloc(self.walk_stmt(env, default_branch.1));
+                let new_default_branch =
+                    &*arena.alloc(self.walk_stmt(env, default_branch.1, locations));
 
                 Stmt::Switch {
                     cond_symbol: *cond_symbol,
@@ -1103,7 +1108,7 @@ impl<'a> TrmcEnv<'a> {
                 self.non_trmc_return(env, *symbol)
             }
             Stmt::Refcounting(op, next) => {
-                let new_next = self.walk_stmt(env, next);
+                let new_next = self.walk_stmt(env, next, locations);
                 Stmt::Refcounting(*op, arena.alloc(new_next))
             }
             Stmt::Expect {
@@ -1117,7 +1122,7 @@ impl<'a> TrmcEnv<'a> {
                 region: *region,
                 lookups,
                 variables,
-                remainder: arena.alloc(self.walk_stmt(env, remainder)),
+                remainder: arena.alloc(self.walk_stmt(env, remainder, locations)),
             },
             Stmt::ExpectFx {
                 condition,
@@ -1130,7 +1135,7 @@ impl<'a> TrmcEnv<'a> {
                 region: *region,
                 lookups,
                 variables,
-                remainder: arena.alloc(self.walk_stmt(env, remainder)),
+                remainder: arena.alloc(self.walk_stmt(env, remainder, locations)),
             },
             Stmt::Dbg {
                 source_location,
@@ -1143,7 +1148,7 @@ impl<'a> TrmcEnv<'a> {
                 source,
                 symbol: *symbol,
                 variable: *variable,
-                remainder: arena.alloc(self.walk_stmt(env, remainder)),
+                remainder: arena.alloc(self.walk_stmt(env, remainder, locations)),
             },
             Stmt::Join {
                 id,
@@ -1151,8 +1156,8 @@ impl<'a> TrmcEnv<'a> {
                 body,
                 remainder,
             } => {
-                let new_body = self.walk_stmt(env, body);
-                let new_remainder = self.walk_stmt(env, remainder);
+                let new_body = self.walk_stmt(env, body, locations);
+                let new_remainder = self.walk_stmt(env, remainder, locations);
 
                 Stmt::Join {
                     id: *id,
