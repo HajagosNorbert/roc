@@ -3651,15 +3651,15 @@ impl<
         }
     }
 
+    //TODO: delete unused tag_id
     fn load_union_field_ptr_at_index(
         &mut self,
         sym: &Symbol,
         structure: &Symbol,
-        tag_id: TagIdIntType,
+        _todo_delete_me_later_tag_id: TagIdIntType,
         index: &[u64],
         union_layout: &UnionLayout<'a>,
     ) {
-        println!("{:#?}", index);
         let tag_id = index[0] as TagIdIntType;
         let ptr_reg = self
             .storage_manager
@@ -3685,12 +3685,6 @@ impl<
                 nullable_id,
                 other_fields,
             } => {
-                // println!("*******************LAYOUT*******************");
-                // println!("{:#?}", union_layout);
-                // println!("*******************INTERN*******************");
-                // println!("{:#?}", self.layout_interner);
-                // println!("*******************FIELD LAYOUT*******************");
-                // println!("{:#?}", self.layout_interner.get(other_fields[0]));
                 debug_assert_ne!(tag_id, *nullable_id as TagIdIntType);
 
                 let offset = load_union_field_ptr_at_index_help(
