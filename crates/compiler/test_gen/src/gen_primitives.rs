@@ -4583,7 +4583,7 @@ fn linked_list_trmc() {
 
 #[test]
 #[cfg(any(feature = "gen-llvm", feature = "gen-wasm", feature = "gen-dev"))]
-fn norbi() {
+fn temporary_test_for_norbi() {
     assert_evals_to!(
         indoc!(
             r#"
@@ -4608,7 +4608,7 @@ fn norbi() {
                 seq 10 |> car
            "#
         ),
-        9000000 ,
+        9000000,
         i64
     );
 }
