@@ -870,7 +870,7 @@ trait Backend<'a> {
                     sym,
                     structure,
                     indices[0] as u16,
-                    indices[1],
+                    indices,
                     union_layout,
                 );
             }
@@ -2559,7 +2559,7 @@ trait Backend<'a> {
         sym: &Symbol,
         structure: &Symbol,
         tag_id: TagIdIntType,
-        index: u64,
+        index: &[u64],
         union_layout: &UnionLayout<'a>,
     );
 
