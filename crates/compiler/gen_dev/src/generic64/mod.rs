@@ -3448,12 +3448,7 @@ impl<
                 unreachable!("operation not supported")
             }
             UnionLayout::NonNullableUnwrapped(field_layouts) => {
-                let offset = load_union_field_ptr_at_index_help(
-                    self.layout_interner,
-                    indices,
-                    field_layouts,
-                    0,
-                );
+                let offset = get_field_ptr_offset(self.layout_interner, indices, field_layouts);
 
                 ASM::add_reg64_reg64_imm32(&mut self.buf, sym_reg, ptr_reg, offset as i32);
             }
@@ -3463,12 +3458,7 @@ impl<
             } => {
                 debug_assert_ne!(tag_id, *nullable_id as TagIdIntType);
 
-                let offset = load_union_field_ptr_at_index_help(
-                    self.layout_interner,
-                    indices,
-                    other_fields,
-                    0,
-                );
+                let offset = get_field_ptr_offset(self.layout_interner, indices, other_fields);
 
                 ASM::add_reg64_reg64_imm32(&mut self.buf, sym_reg, ptr_reg, offset as i32);
             }
@@ -3487,12 +3477,7 @@ impl<
 
                 let (mask_symbol, mask_reg) = self.clear_tag_id(ptr_reg);
 
-                let offset = load_union_field_ptr_at_index_help(
-                    self.layout_interner,
-                    indices,
-                    other_fields,
-                    0,
-                );
+                let offset = get_field_ptr_offset(self.layout_interner, indices, other_fields);
 
                 ASM::add_reg64_reg64_imm32(&mut self.buf, sym_reg, mask_reg, offset as i32);
 
@@ -3514,12 +3499,7 @@ impl<
                         (Some(mask_symbol), mask_reg)
                     };
 
-                let offset = load_union_field_ptr_at_index_help(
-                    self.layout_interner,
-                    indices,
-                    other_fields,
-                    0,
-                );
+                let offset = get_field_ptr_offset(self.layout_interner, indices, other_fields);
 
                 ASM::add_reg64_reg64_imm32(&mut self.buf, sym_reg, unmasked_reg, offset as i32);
 
@@ -5422,44 +5402,47 @@ impl<
     }
 }
 
-fn load_union_field_ptr_at_index_help<'a>(
+fn get_field_ptr_offset<'a>(
     layout_interner: &'a STLayoutInterner<'a>,
     indices: &[u64],
     layouts: &[InLayout<'a>],
-    mut offset: u32,
 ) -> u32 {
-    debug_assert_ne!(indices.len(), 0);
+    let mut layouts = layouts;
+    let mut offset: u32 = 0;
+    let mut i = 0;
 
-    let idx = indices[0];
-    for field in &layouts[..idx as usize] {
-        offset += layout_interner.stack_size(*field);
-    }
-
-    if indices.len() <= 1 {
-        return offset;
-    }
-    use LayoutRepr::*;
-    let enclosing_layout = layouts[idx as usize];
-    return match layout_interner.get_repr(enclosing_layout) {
-        Struct(layouts) => {
-            load_union_field_ptr_at_index_help(layout_interner, &indices[1..], layouts, offset)
-        },
-        Union(UnionLayout::NonRecursive(tags)) => {
-            // apart from the current index, to get information out of a
-            // non-recursive tag union we need 2 more number: a tag id and an index
-            debug_assert!(indices.len() >= 3);
-            let tag_id = indices[1] as usize;
-            let tag_layout = tags[tag_id];
-
-            load_union_field_ptr_at_index_help(layout_interner, &indices[2..], tag_layout, offset)
+    while i < indices.len() {
+        let layout_idx = indices[i];
+        for field in &layouts[..layout_idx as usize] {
+            offset += layout_interner.stack_size(*field);
         }
-        //TODO: can any of these be a valid target for getting a pointer out of their inner layouts?
-        //(so not them being pointers)
-        Union(_) | Builtin(_) | Ptr(_) | RecursivePointer(_) | LambdaSet(_) | FunctionPointer(_)
-        | Erased(_) => unreachable!(
-            "Following the path of the indices, a layout has been reached where the address of the desired pointer is behind another pointer"
-        ),
-    };
+
+        use LayoutRepr::*;
+        let selected_layout = layouts[layout_idx as usize];
+        match layout_interner.get_repr(selected_layout) {
+            Struct(struct_layouts) => {
+                layouts = struct_layouts;
+                i+=1
+            },
+            Union(UnionLayout::NonRecursive(tags)) => {
+                // to get information out of a
+                // non-recursive tag union we need 2 more number:
+                // a tag id and an index of it's argument
+                debug_assert!(i + 2 <= indices.len());
+                let tag_id = indices[i+1] as usize;
+                let tag_layouts = tags[tag_id];
+                layouts = tag_layouts;
+                i+=2;
+            },
+            Union(_) | Ptr(_) | RecursivePointer(_) | FunctionPointer(_) | Erased(_) => {
+                debug_assert_eq!(i + 1, indices.len());
+                return offset;
+            },
+            LambdaSet(_) => unreachable!("Trying to obtain a pointer from a labda set (or treat the lambda set as a pointer). As of writing, this functionality was created to enable TRMC optimization, which isn't done on lambda sets."),
+            Builtin(_) =>  unreachable!("Trying to obtain a pointer from a builtin (or treat the builtin as a pointer). As of writing, this functionality was created to enable TRMC optimization, which isn't done on builtins."),
+        };
+    }
+    unreachable!("The indicies didn't lead to a pointer.");
 }
 
 #[macro_export]

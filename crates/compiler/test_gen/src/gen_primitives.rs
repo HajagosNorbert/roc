@@ -4564,16 +4564,16 @@ fn linked_list_trmc() {
                     0 -> Nil
                     _ -> Cons value (repeat value (n - 1))
 
-            length : LinkedList a -> I64
-            length = \list ->
+            length : LinkedList a, I64 -> I64
+            length = \list, acc ->
                 when list is
-                    Nil -> 0
-                    Cons _ rest -> 1 + length rest
+                    Nil -> acc
+                    Cons _ rest -> length rest (acc+1)
 
             main : I64
             main =
                 repeat "foo" 5
-                    |> length
+                    |> length 0
             "#
         ),
         5,
@@ -4582,7 +4582,40 @@ fn linked_list_trmc() {
 }
 
 #[test]
-#[cfg(feature = "gen-dev")]
+#[cfg(any(feature = "gen-llvm", feature = "gen-dev", feature = "gen-wasm"))]
+fn linked_list_with_record_trmc() {
+    assert_evals_to!(
+        indoc!(
+            r#"
+            app "test" provides [main] to "./platform"
+
+            LinkedList a : [Nil, Cons { first : a, rest : LinkedList a }]
+
+            repeat : a, U64 -> LinkedList a
+            repeat = \value, n ->
+                when n is
+                    0 -> Nil
+                    _ -> Cons { first: value, rest: repeat value (n - 1) }
+
+            length : LinkedList a, I64 -> I64
+            length = \list, acc ->
+                when list is
+                    Nil -> acc
+                    Cons { rest } -> length rest (acc+1)
+
+            main : I64
+            main =
+                repeat "foo" 5
+                    |> length 0
+            "#
+        ),
+        5,
+        i64
+    );
+}
+
+#[test]
+#[cfg(any(feature = "gen-llvm", feature = "gen-dev", feature = "gen-wasm"))]
 fn linked_list_with_nested_records_trmc() {
     assert_evals_to!(
         indoc!(
@@ -4597,48 +4630,15 @@ fn linked_list_with_nested_records_trmc() {
                 else
                     Cons {  f: {d: value, aaa: {rest: repeat value (n - 1)}}, z: {a: value, b: value} }
 
-            length : LinkedList a -> I64
-            length = \list ->
+            length : LinkedList a, I64 -> I64
+            length = \list, acc ->
                 when list is
-                    Nil -> 0
-                    Cons { f: {aaa: {rest}} } -> 1 + length rest
+                    Nil -> acc
+                    Cons { f: {aaa: {rest}} } -> length rest (acc+1)
 
             #main : I64
-            main =             
-                repeat "foo" 5 |> length
-            "#
-        ),
-        5,
-        i64
-    );
-}
-
-#[test]
-#[cfg(feature = "gen-dev")]
-fn linked_list_with_record_trmc() {
-    assert_evals_to!(
-        indoc!(
-            r#"
-            app "test" provides [main] to "./platform"
-
-            LinkedList a : [Nil, Cons { first : a, rest : LinkedList a }]
-
-            repeat : a, Nat -> LinkedList a
-            repeat = \value, n ->
-                when n is
-                    0 -> Nil
-                    _ -> Cons { first: value, rest: repeat value (n - 1) }
-
-            length : LinkedList a -> I64
-            length = \list ->
-                when list is
-                    Nil -> 0
-                    Cons { rest } -> 1 + length rest
-
-            main : I64
             main =
-                repeat "foo" 5
-                    |> length
+                repeat "foo" 5 |> length 0
             "#
         ),
         5,

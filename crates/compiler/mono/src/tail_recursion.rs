@@ -199,13 +199,8 @@ fn insert_jumps<'a>(
                 needle_result,
             );
 
-            if opt_cont.is_some() {
-                let cont = opt_cont.unwrap_or(cont);
-
-                Some(arena.alloc(Let(*symbol, expr.clone(), *layout, cont)))
-            } else {
-                None
-            }
+            let cont = opt_cont?;
+            Some(arena.alloc(Let(*symbol, expr.clone(), *layout, cont)))
         }
 
         Join {
@@ -231,19 +226,15 @@ fn insert_jumps<'a>(
                 needle_result,
             );
 
-            if opt_remainder.is_some() || opt_continuation.is_some() {
-                let remainder = opt_remainder.unwrap_or(remainder);
-                let continuation = opt_continuation.unwrap_or(*continuation);
+            let remainder = opt_remainder?;
+            let continuation = opt_continuation?;
 
-                Some(arena.alloc(Join {
-                    id: *id,
-                    parameters,
-                    remainder,
-                    body: continuation,
-                }))
-            } else {
-                None
-            }
+            Some(arena.alloc(Join {
+                id: *id,
+                parameters,
+                remainder,
+                body: continuation,
+            }))
         }
         Switch {
             cond_symbol,
@@ -643,27 +634,26 @@ fn invalidate_on_nested_rec_call_use<'a>(candidates: &mut TrmcCandidateSet<'a>, 
 /// 2) (arbitrary deep nesting of structs containing a)
 ///    struct that contains a recursive call's return value
 fn is_trmc_confirmed<'a>(candidates: &mut TrmcCandidateSet<'a>, stmt: &Stmt<'a>) -> Option<usize> {
-    if let Some(cons_info) = TrmcEnv::is_terminal_constructor(stmt) {
-        for (arg_idx, &arg) in cons_info.arguments.iter().enumerate() {
-            for i in 0..candidates.interner.len() {
-                if !candidates.is_active_at(i) {
-                    continue;
-                }
-                let chain = &candidates.interner[i];
-                let tail_tag_arg_candidate = chain.tail_tag_arg();
-                if arg == tail_tag_arg_candidate {
-                    // same candidate occuring more than once
-                    // in the same tag application is not allowed
-                    if cons_info
-                        .arguments
-                        .iter()
-                        .skip(arg_idx + 1)
-                        .any(|arg| *arg == tail_tag_arg_candidate)
-                    {
-                        candidates.invalidate_at(i);
-                    } else {
-                        return Some(i);
-                    }
+    let cons_info = TrmcEnv::is_terminal_constructor(stmt)?;
+    for (arg_idx, &arg) in cons_info.arguments.iter().enumerate() {
+        for i in 0..candidates.interner.len() {
+            if !candidates.is_active_at(i) {
+                continue;
+            }
+            let chain = &candidates.interner[i];
+            let tail_tag_arg_candidate = chain.tail_tag_arg();
+            if arg == tail_tag_arg_candidate {
+                // same candidate occuring more than once
+                // in the same tag application is not allowed
+                if cons_info
+                    .arguments
+                    .iter()
+                    .skip(arg_idx + 1)
+                    .any(|arg| *arg == tail_tag_arg_candidate)
+                {
+                    candidates.invalidate_at(i);
+                } else {
+                    return Some(i);
                 }
             }
         }
@@ -768,16 +758,22 @@ struct ConstructorInfo<'a> {
     arguments: &'a [Symbol],
 }
 
-#[derive(Debug)]
-struct TailTagArgInfo<'a> {
-    top_container: Symbol,
-    indices_from_top_to_rec_call: &'a [u64],
+struct ConsWitRecCallInside<'a> {
+    rec_call_idx_in_cons_args: usize,
+    rec_call: &'a Call<'a>,
+    call_location: &'a RecCallLocation<'a>,
 }
 
 #[derive(Debug)]
 enum RecCallLocation<'a> {
     DirectlyInTag,
-    MemberOfStruct(TailTagArgInfo<'a>),
+    MemberOfStruct(RecCallLocationInNestedData<'a>),
+}
+
+#[derive(Debug)]
+struct RecCallLocationInNestedData<'a> {
+    top_container: Symbol,
+    indices_from_top_to_rec_call: &'a [u64],
 }
 
 impl<'a> TrmcEnv<'a> {
@@ -920,7 +916,7 @@ impl<'a> TrmcEnv<'a> {
             } else {
                 let indices = arena.alloc(chain.indices.clone());
                 indices.reverse();
-                RecCallLocation::MemberOfStruct(TailTagArgInfo {
+                RecCallLocation::MemberOfStruct(RecCallLocationInNestedData {
                     top_container: chain.tail_tag_arg(),
                     indices_from_top_to_rec_call: indices,
                 })
@@ -983,6 +979,223 @@ impl<'a> TrmcEnv<'a> {
         }
     }
 
+    /// Checks if this is a struct with one of the field being a trmc eligible recursive call
+    /// if so, replaces that call with a null pointer
+    fn found_trmc_call_inside_struct<'b>(
+        &mut self,
+        env: &mut Env<'a, '_>,
+        symbol: &Symbol,
+        expr: &Expr<'a>,
+        layout: &InLayout<'a>,
+        next: &'a Stmt<'a>,
+        trmc_call_locations: &'b [RecCallLocation],
+    ) -> Option<Stmt<'a>> {
+        if let Expr::Struct(args) = expr {
+            let rec_call_struct_index_opt = args
+                .iter()
+                .position(|arg| self.trmc_calls.keys().any(|call| *call == *arg));
+
+            if let Some(rec_call_struct_arg_index) = rec_call_struct_index_opt {
+                let struct_arg_null_symbol = env.named_unique_symbol("struct_arg_null");
+
+                let args_with_hole = env.arena.alloc_slice_copy(args);
+                args_with_hole[rec_call_struct_arg_index] = struct_arg_null_symbol;
+
+                let struct_with_hole = Expr::Struct(args_with_hole);
+                let let_struct_with_hole =
+                    |next| Stmt::Let(*symbol, struct_with_hole, *layout, next);
+
+                let remaining = self.walk_stmt(env, next, trmc_call_locations);
+
+                let output = Stmt::Let(
+                    struct_arg_null_symbol,
+                    Expr::NullPointer,
+                    self.return_layout,
+                    env.arena.alloc(
+                        //
+                        let_struct_with_hole(env.arena.alloc(
+                            //
+                            remaining,
+                        )),
+                    ),
+                );
+                return Some(output);
+            }
+        }
+        return None;
+    }
+
+    fn transform_termial_constructor<'b>(
+        &self,
+        env: &mut Env<'a, '_>,
+        symbol: &Symbol,
+        expr: &Expr<'a>,
+        layout: &InLayout<'a>,
+        cons_info: ConstructorInfo<'a>,
+        trmc_call_locations: &'b [RecCallLocation],
+    ) -> Stmt<'a> {
+        let arena = env.arena;
+        let opt_recursive_call_inside_cons =
+            cons_info
+                .arguments
+                .iter()
+                .enumerate()
+                .find_map(|(arg_idx, arg)| {
+                    self.trmc_calls
+                        .keys()
+                        .enumerate()
+                        .position(|(i, call)| match trmc_call_locations[i] {
+                            RecCallLocation::DirectlyInTag => *arg == *call,
+                            RecCallLocation::MemberOfStruct(RecCallLocationInNestedData {
+                                top_container,
+                                ..
+                            }) => *arg == top_container,
+                        })
+                        .and_then(|idx| {
+                            self.trmc_calls
+                                .values()
+                                .nth(idx)
+                                .unwrap()
+                                .as_ref()
+                                .map(|call| ConsWitRecCallInside {
+                                    rec_call_idx_in_cons_args: arg_idx,
+                                    rec_call: call,
+                                    call_location: &trmc_call_locations[idx],
+                                })
+                        })
+                });
+        match opt_recursive_call_inside_cons {
+            None => {
+                // this control flow path did not encounter a recursive call. Just
+                // write the end result into the hole and we're done.
+
+                let define_tag = |next| Stmt::Let(*symbol, expr.clone(), *layout, next);
+
+                let output = define_tag(arena.alloc(
+                    //
+                    self.non_trmc_return(env, *symbol),
+                ));
+
+                return output;
+            }
+
+            Some(rec_call_info) => {
+                return self.transform_trmc(env, symbol, expr, layout, cons_info, rec_call_info)
+            }
+        }
+    }
+
+    /// Perform TRMC in this branch, because we've
+    /// encountered a recursive call inside a recursive tag union.
+    fn transform_trmc(
+        &self,
+        env: &mut Env<'a, '_>,
+        symbol: &Symbol,
+        expr: &Expr<'a>,
+        layout: &InLayout<'a>,
+        cons_info: ConstructorInfo<'a>,
+        rec_call_info: ConsWitRecCallInside<'_>,
+    ) -> Stmt<'a> {
+        let arena = env.arena;
+        let ConsWitRecCallInside {
+            rec_call_idx_in_cons_args: rec_field_idx,
+            rec_call: call,
+            call_location,
+        } = rec_call_info;
+
+        let new_hole_symbol = env.named_unique_symbol("newHole");
+        let let_new_hole = |get_reference_expr: Expr<'a>, next| {
+            Stmt::Let(
+                new_hole_symbol,
+                get_reference_expr,
+                self.ptr_return_layout,
+                next,
+            )
+        };
+
+        let mut jump_arguments = Vec::from_iter_in(call.arguments.iter().copied(), env.arena);
+        jump_arguments.push(new_hole_symbol);
+        jump_arguments.push(self.head_symbol);
+        let jump = Stmt::Jump(self.joinpoint_id, jump_arguments.into_bump_slice());
+
+        match call_location {
+            RecCallLocation::DirectlyInTag => {
+                let tag_arg_null_symbol = env.named_unique_symbol("tag_arg_null");
+                let let_tag_arg_null = |next| {
+                    Stmt::Let(
+                        tag_arg_null_symbol,
+                        Expr::NullPointer,
+                        self.return_layout,
+                        next,
+                    )
+                };
+
+                let arguments = arena.alloc_slice_copy(cons_info.arguments);
+                arguments[rec_field_idx] = tag_arg_null_symbol;
+
+                let tag_expr = Expr::Tag {
+                    tag_layout: cons_info.tag_layout,
+                    tag_id: cons_info.tag_id,
+                    arguments,
+                    reuse: None,
+                };
+                let let_tag = |next| Stmt::Let(*symbol, tag_expr, *layout, next);
+
+                let indices = arena.alloc([cons_info.tag_id as u64, rec_field_idx as u64]);
+                let get_reference_expr = Expr::GetElementPointer {
+                    structure: *symbol,
+                    union_layout: cons_info.tag_layout,
+                    indices,
+                };
+
+                let output = let_tag_arg_null(arena.alloc(
+                    //
+                    let_tag(arena.alloc(
+                        //
+                        let_new_hole(
+                            get_reference_expr,
+                            arena.alloc(
+                                //
+                                Self::ptr_write(env, self.hole_symbol, *symbol, arena.alloc(jump)),
+                            ),
+                        ),
+                    )),
+                ));
+                return output;
+            }
+            RecCallLocation::MemberOfStruct(RecCallLocationInNestedData {
+                indices_from_top_to_rec_call,
+                ..
+            }) => {
+                let let_tag = |next| Stmt::Let(*symbol, expr.clone(), *layout, next);
+
+                let mut indices =
+                    vec::Vec::with_capacity_in(2 + indices_from_top_to_rec_call.len(), arena);
+                indices.push(cons_info.tag_id as u64);
+                indices.push(rec_field_idx as u64);
+                indices.extend(indices_from_top_to_rec_call.iter());
+                let indices = indices.into_bump_slice();
+
+                let get_reference_expr = Expr::GetElementPointer {
+                    structure: *symbol,
+                    union_layout: cons_info.tag_layout,
+                    indices,
+                };
+
+                let output = let_tag(arena.alloc(
+                    //
+                    let_new_hole(
+                        get_reference_expr,
+                        arena.alloc(
+                            //
+                            Self::ptr_write(env, self.hole_symbol, *symbol, arena.alloc(jump)),
+                        ),
+                    ),
+                ));
+                return output;
+            }
+        }
+    }
     fn walk_stmt<'b>(
         &mut self,
         env: &mut Env<'a, '_>,
@@ -994,6 +1207,16 @@ impl<'a> TrmcEnv<'a> {
 
         match stmt {
             Stmt::Let(symbol, expr, layout, next) => {
+                if let Some(value) = self.found_trmc_call_inside_struct(
+                    env,
+                    symbol,
+                    expr,
+                    layout,
+                    next,
+                    trmc_call_locations,
+                ) {
+                    return value;
+                }
                 // if this is a TRMC call, save what the call expr looks like into trmc_calls, so we can turn it
                 // into a jump later. The call is then removed from the Stmt
                 if let Some(opt_call) = self.trmc_calls.get_mut(symbol) {
@@ -1011,8 +1234,6 @@ impl<'a> TrmcEnv<'a> {
                     return self.walk_stmt(env, next, trmc_call_locations);
                 }
 
-                // Checks if this is a struct with one of the field being a trmc eligible recursive call
-                // if so, replaces that call with a null pointer
                 if let Expr::Struct(args) = expr {
                     let rec_call_struct_index_opt = args
                         .iter()
@@ -1061,163 +1282,14 @@ impl<'a> TrmcEnv<'a> {
                 }
 
                 if let Some(cons_info) = Self::is_terminal_constructor(stmt) {
-                    // figure out which TRMC call to use here. We pick the first one that works
-                    let opt_recursive_call =
-                        cons_info
-                            .arguments
-                            .iter()
-                            .enumerate()
-                            .find_map(|(arg_idx, arg)| {
-                                self.trmc_calls
-                                    .keys()
-                                    .enumerate()
-                                    .position(|(i, call)| match trmc_call_locations[i] {
-                                        RecCallLocation::DirectlyInTag => *arg == *call,
-                                        RecCallLocation::MemberOfStruct(TailTagArgInfo {
-                                            top_container,
-                                            ..
-                                        }) => *arg == top_container,
-                                    })
-                                    .and_then(|idx| {
-                                        self.trmc_calls
-                                            .values()
-                                            .nth(idx)
-                                            .unwrap()
-                                            .as_ref()
-                                            .map(|call| (arg_idx, call, &trmc_call_locations[idx]))
-                                    })
-                            });
-                    match opt_recursive_call {
-                        None => {
-                            // this control flow path did not encounter a recursive call. Just
-                            // write the end result into the hole and we're done.
-
-                            let define_tag = |next| Stmt::Let(*symbol, expr.clone(), *layout, next);
-
-                            let output = define_tag(arena.alloc(
-                                //
-                                self.non_trmc_return(env, *symbol),
-                            ));
-
-                            return output;
-                        }
-
-                        Some((recursive_field_index, call, call_location)) => {
-                            // we did encounter a recursive call, and can perform TRMC in this
-                            // branch.
-
-                            let new_hole_symbol = env.named_unique_symbol("newHole");
-                            let let_new_hole = |get_reference_expr: Expr<'a>, next| {
-                                Stmt::Let(
-                                    new_hole_symbol,
-                                    get_reference_expr,
-                                    self.ptr_return_layout,
-                                    next,
-                                )
-                            };
-
-                            let mut jump_arguments =
-                                Vec::from_iter_in(call.arguments.iter().copied(), env.arena);
-                            jump_arguments.push(new_hole_symbol);
-                            jump_arguments.push(self.head_symbol);
-                            let jump =
-                                Stmt::Jump(self.joinpoint_id, jump_arguments.into_bump_slice());
-
-                            match call_location {
-                                RecCallLocation::DirectlyInTag => {
-                                    let tag_arg_null_symbol =
-                                        env.named_unique_symbol("tag_arg_null");
-                                    let let_tag_arg_null = |next| {
-                                        Stmt::Let(
-                                            tag_arg_null_symbol,
-                                            Expr::NullPointer,
-                                            self.return_layout,
-                                            next,
-                                        )
-                                    };
-
-                                    let arguments = arena.alloc_slice_copy(cons_info.arguments);
-                                    arguments[recursive_field_index] = tag_arg_null_symbol;
-
-                                    let tag_expr = Expr::Tag {
-                                        tag_layout: cons_info.tag_layout,
-                                        tag_id: cons_info.tag_id,
-                                        arguments,
-                                        reuse: None,
-                                    };
-                                    let let_tag =
-                                        |next| Stmt::Let(*symbol, tag_expr, *layout, next);
-
-                                    let indices = arena.alloc([
-                                        cons_info.tag_id as u64,
-                                        recursive_field_index as u64,
-                                    ]);
-                                    let get_reference_expr = Expr::GetElementPointer {
-                                        structure: *symbol,
-                                        union_layout: cons_info.tag_layout,
-                                        indices,
-                                    };
-
-                                    let output = let_tag_arg_null(arena.alloc(
-                                        //
-                                        let_tag(arena.alloc(
-                                            //
-                                            let_new_hole(
-                                                get_reference_expr,
-                                                arena.alloc(
-                                                    //
-                                                    Self::ptr_write(
-                                                        env,
-                                                        self.hole_symbol,
-                                                        *symbol,
-                                                        arena.alloc(jump),
-                                                    ),
-                                                ),
-                                            ),
-                                        )),
-                                    ));
-                                    return output;
-                                }
-                                RecCallLocation::MemberOfStruct(TailTagArgInfo {
-                                    indices_from_top_to_rec_call: struct_indices,
-                                    ..
-                                }) => {
-                                    let let_tag =
-                                        |next| Stmt::Let(*symbol, expr.clone(), *layout, next);
-
-                                    let mut indices =
-                                        vec::Vec::with_capacity_in(2 + struct_indices.len(), arena);
-                                    indices.push(cons_info.tag_id as u64);
-                                    indices.push(recursive_field_index as u64);
-                                    indices.extend(struct_indices.iter());
-                                    let indices = indices.into_bump_slice();
-
-                                    let get_reference_expr = Expr::GetElementPointer {
-                                        structure: *symbol,
-                                        union_layout: cons_info.tag_layout,
-                                        indices,
-                                    };
-
-                                    let output = let_tag(arena.alloc(
-                                        //
-                                        let_new_hole(
-                                            get_reference_expr,
-                                            arena.alloc(
-                                                //
-                                                Self::ptr_write(
-                                                    env,
-                                                    self.hole_symbol,
-                                                    *symbol,
-                                                    arena.alloc(jump),
-                                                ),
-                                            ),
-                                        ),
-                                    ));
-                                    return output;
-                                }
-                            }
-                        }
-                    }
+                    return self.transform_termial_constructor(
+                        env,
+                        symbol,
+                        expr,
+                        layout,
+                        cons_info,
+                        trmc_call_locations,
+                    );
                 }
 
                 let next = self.walk_stmt(env, next, trmc_call_locations);
@@ -1318,7 +1390,7 @@ impl<'a> TrmcEnv<'a> {
         }
     }
 
-    fn non_trmc_return(&mut self, env: &mut Env<'a, '_>, value_symbol: Symbol) -> Stmt<'a> {
+    fn non_trmc_return(&self, env: &mut Env<'a, '_>, value_symbol: Symbol) -> Stmt<'a> {
         let arena = env.arena;
         let layout = self.return_layout;
 
