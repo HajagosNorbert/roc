@@ -1339,9 +1339,6 @@ fn expr_spec<'a>(
             //there is at least 2 more "indices".
             //1st is the tag_id, 2nd is the
             //index and so on recursively for arbitrary length.
-            debug_assert!(indices.len() == 2);
-            let tag_id = indices[0] as u32;
-            let index = indices[1];
             let tag_value_id = env.symbols[structure];
 
             let type_name_bytes = recursive_tag_union_name_bytes(union_layout).as_bytes();
@@ -1358,9 +1355,16 @@ fn expr_spec<'a>(
             builder.add_touch(block, heap_cell)?;
 
             // next, unwrap the union at the tag id that we've got
+            let tag_id = indices[0] as u32;
             let variant_id = builder.add_unwrap_union(block, union_data, tag_id)?;
 
-            let value = builder.add_get_tuple_field(block, variant_id, index as u32)?;
+            //TODO: This handles the tag argument being a pointer
+            // or arbitrarily nested structs containing the pointer, but no the case when the
+            // argument is a non-recursive tag union
+            let mut value = variant_id;
+            for &index in &indices[1..] {
+                value = builder.add_get_tuple_field(block, value, index as u32)?;
+            }
 
             // construct the box. Here the heap_cell of the tag is re-used, I'm hoping that that
             // conveys to morphic that we're borrowing into the existing tag?!
