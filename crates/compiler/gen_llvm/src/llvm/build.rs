@@ -2074,7 +2074,7 @@ pub(crate) fn build_exp_expr<'a, 'ctx>(
         } => {
             debug_assert!(indices.len() >= 2);
             let tag_id = indices[0];
-            let index = indices[1] as usize;
+            let indices = &indices[1..];
             // cast the argument bytes into the desired shape for this tag
             let argument = scope.load_symbol(structure);
             let ret_repr = layout_interner.get_repr(layout);
@@ -2094,7 +2094,7 @@ pub(crate) fn build_exp_expr<'a, 'ctx>(
                         layout_interner,
                         field_layouts,
                         None,
-                        index,
+                        indices,
                         ptr,
                         target_loaded_type,
                     )
@@ -2110,7 +2110,7 @@ pub(crate) fn build_exp_expr<'a, 'ctx>(
                         layout_interner,
                         field_layouts,
                         Some(struct_type.into_struct_type()),
-                        index,
+                        indices,
                         argument.into_pointer_value(),
                         target_loaded_type,
                     )
@@ -2139,7 +2139,7 @@ pub(crate) fn build_exp_expr<'a, 'ctx>(
                         layout_interner,
                         field_layouts,
                         None,
-                        index,
+                        indices,
                         ptr,
                         target_loaded_type,
                     )
@@ -2163,7 +2163,7 @@ pub(crate) fn build_exp_expr<'a, 'ctx>(
                         field_layouts,
                         Some(struct_type.into_struct_type()),
                         // the tag id is not stored
-                        index,
+                        indices,
                         argument.into_pointer_value(),
                         target_loaded_type,
                     )
@@ -2772,6 +2772,47 @@ fn lookup_at_index_ptr<'a, 'ctx>(
     cast_if_necessary_for_opaque_recursive_pointers(env, result, target_loaded_type)
 }
 
+fn union_field_ptr_at_indices_help<'a, 'ctx>(
+    env: &Env<'a, 'ctx, '_>,
+    layout_interner: &STLayoutInterner<'a>,
+    field_layouts: &'a [InLayout<'a>],
+    opt_struct_type: Option<StructType<'ctx>>,
+    indices: &[u64],
+    value: PointerValue<'ctx>,
+) -> PointerValue<'ctx> {
+    let builder = env.builder;
+
+    let struct_type = match opt_struct_type {
+        Some(st) => st,
+        None => {
+            let struct_layout = LayoutRepr::struct_(field_layouts);
+            basic_type_from_layout(env, layout_interner, struct_layout).into_struct_type()
+        }
+    };
+
+    let data_ptr = env.builder.new_build_pointer_cast(
+        value,
+        struct_type.ptr_type(AddressSpace::default()),
+        "cast_lookup_at_index_ptr",
+    );
+
+    let i32_type = env.context.i32_type();
+    let mut indices_int_value: Vec<'_, _> = Vec::with_capacity_in(indices.len(), env.arena);
+    for &index in indices {
+        let index_int_value = i32_type.const_int(index, false);
+        indices_int_value.push(index_int_value);
+    }
+
+    unsafe {
+        return builder.new_build_in_bounds_gep(
+            struct_type,
+            data_ptr,
+            &indices_int_value,
+            "at_indices_struct_gep_data",
+        );
+    }
+}
+
 fn union_field_ptr_at_index_help<'a, 'ctx>(
     env: &Env<'a, 'ctx, '_>,
     layout_interner: &STLayoutInterner<'a>,
@@ -2809,16 +2850,16 @@ fn union_field_ptr_at_index<'a, 'ctx>(
     layout_interner: &STLayoutInterner<'a>,
     field_layouts: &'a [InLayout<'a>],
     opt_struct_type: Option<StructType<'ctx>>,
-    index: usize,
+    indices: &[u64],
     value: PointerValue<'ctx>,
     target_loaded_type: BasicTypeEnum<'ctx>,
 ) -> PointerValue<'ctx> {
-    let result = union_field_ptr_at_index_help(
+    let result = union_field_ptr_at_indices_help(
         env,
         layout_interner,
         field_layouts,
         opt_struct_type,
-        index,
+        indices,
         value,
     );
 
